@@ -199,6 +199,11 @@ export class Live {
 
     const apiClient = this.apiClient;
     let sessionResolved = false;
+    let socketClosed = false;
+    let connectionReject: (reason: Error) => void = () => {};
+    const connectionFailure = new Promise<never>((_resolve, reject) => {
+      connectionReject = reject;
+    });
     const messageQueue: types.LiveServerMessage[] = [];
     let setupCompleteResolve: (value: unknown) => void = () => {};
     const setupCompletePromise = new Promise((resolve) => {
@@ -224,16 +229,25 @@ export class Live {
           event,
         );
       },
-      onerror:
-        callbacks?.onerror ??
-        function (e: ErrorEvent) {
-          void e;
-        },
-      onclose:
-        callbacks?.onclose ??
-        function (e: CloseEvent) {
-          void e;
-        },
+      onerror: (e: ErrorEvent) => {
+        if (!sessionResolved) {
+          connectionReject(
+            new Error(e.message || 'WebSocket connection failed'),
+          );
+        }
+        callbacks?.onerror?.(e);
+      },
+      onclose: (e: CloseEvent) => {
+        socketClosed = true;
+        if (!sessionResolved) {
+          connectionReject(
+            new Error(
+              `WebSocket closed before session setup completed: ${e.code} ${e.reason}`,
+            ),
+          );
+        }
+        callbacks?.onclose?.(e);
+      },
     };
 
     const conn = this.webSocketFactory.create(
@@ -241,9 +255,17 @@ export class Live {
       headersToMap(headers),
       websocketCallbacks,
     );
+    const waitForConnection = async <T>(stage: Promise<T>): Promise<T> => {
+      try {
+        return await Promise.race([connectionFailure, stage]);
+      } catch (error) {
+        if (!socketClosed) conn.close();
+        throw error;
+      }
+    };
     conn.connect();
     // Wait for the websocket to open before sending requests.
-    await onopenPromise;
+    await waitForConnection(onopenPromise);
 
     let transformedModel = t.tModel(this.apiClient, params.model);
     if (
@@ -282,7 +304,7 @@ export class Live {
     for (const tool of inputTools) {
       if (this.isCallableTool(tool)) {
         const callableTool = tool as types.CallableTool;
-        convertedTools.push(await callableTool.tool());
+        convertedTools.push(await waitForConnection(callableTool.tool()));
       } else {
         convertedTools.push(tool as types.Tool);
       }
@@ -309,7 +331,7 @@ export class Live {
     delete clientMessage['config'];
     const session = new Session(conn, this.apiClient);
     conn.send(JSON.stringify(clientMessage));
-    await setupCompletePromise;
+    await waitForConnection(setupCompletePromise);
     sessionResolved = true;
     for (const msg of messageQueue) {
       callbacks.onmessage(msg);

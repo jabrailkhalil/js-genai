@@ -18,6 +18,193 @@ import {FakeWebSocket, FakeWebSocketFactory} from '../_fake_websocket.js';
 import {spinUpPrintingServer} from './test_mcp_server.js';
 
 describe('live', () => {
+  describe('connection failures', () => {
+    for (const phase of [
+      'before open',
+      'before setupComplete',
+      'while preparing tools',
+    ]) {
+      for (const eventType of ['error', 'close']) {
+        it(`rejects on ${eventType} ${phase} and preserves callbacks`, async () => {
+          const apiClient = new ApiClient({
+            auth: new FakeAuth(),
+            apiKey: 'test-api-key',
+            uploader: new CrossUploader(),
+            downloader: new CrossDownloader(),
+          });
+          const factory = new FakeWebSocketFactory();
+          const onerror = jasmine.createSpy('onerror');
+          const onclose = jasmine.createSpy('onclose');
+          const errorEvent = {message: 'handshake failed'} as ErrorEvent;
+          const closeEvent = {
+            code: 1008,
+            reason: 'setup refused',
+          } as CloseEvent;
+          let socket: FakeWebSocket;
+          let socketCallbacks: WebSocketCallbacks;
+          let close: jasmine.Spy;
+          let finishTool: (tool: types.Tool) => void;
+          spyOn(factory, 'create').and.callFake((url, headers, callbacks) => {
+            socketCallbacks = callbacks;
+            socket = new FakeWebSocket(url, headers, callbacks);
+            close = spyOn(socket, 'close').and.callThrough();
+            const fail = () => {
+              if (eventType === 'error') callbacks.onerror(errorEvent);
+              else callbacks.onclose(closeEvent);
+            };
+            if (phase === 'before open') {
+              spyOn(socket, 'connect').and.callFake(fail);
+              spyOn(socket, 'send').and.callThrough();
+            } else {
+              spyOn(socket, 'send').and.callFake(fail);
+            }
+            return socket;
+          });
+          const live = new Live(apiClient, new FakeAuth(), factory);
+          let result: unknown;
+          const connecting = live
+            .connect({
+              model: 'models/test-model',
+              callbacks: {onmessage: () => {}, onerror, onclose},
+              config:
+                phase === 'while preparing tools'
+                  ? {
+                      tools: [
+                        {
+                          tool: () => {
+                            if (eventType === 'error') {
+                              socketCallbacks.onerror(errorEvent);
+                            } else {
+                              socketCallbacks.onclose(closeEvent);
+                            }
+                            return new Promise<types.Tool>((resolve) => {
+                              finishTool = resolve;
+                            });
+                          },
+                          callTool: async () => [],
+                        },
+                      ],
+                    }
+                  : undefined,
+            })
+            .then(
+              (session) => {
+                result = session;
+              },
+              (error: unknown) => {
+                result = error;
+              },
+            );
+
+          // Give the promise reactions a turn without waiting on a hung connect.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(result).toEqual(jasmine.any(Error));
+          if (result instanceof Error) {
+            expect(result.message).toContain(
+              eventType === 'error' ? errorEvent.message : closeEvent.reason,
+            );
+            await connecting;
+          }
+          if (eventType === 'error') {
+            expect(onerror).toHaveBeenCalledOnceWith(errorEvent);
+            expect(close!).toHaveBeenCalledTimes(1);
+          } else {
+            expect(onclose).toHaveBeenCalledOnceWith(closeEvent);
+            expect(close!).not.toHaveBeenCalled();
+          }
+          if (phase === 'before open') {
+            expect(socket!.send).not.toHaveBeenCalled();
+            socketCallbacks!.onopen();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(socket!.send).not.toHaveBeenCalled();
+          }
+          if (phase === 'while preparing tools') {
+            expect(socket!.send).not.toHaveBeenCalled();
+            finishTool!({functionDeclarations: []});
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(socket!.send).not.toHaveBeenCalled();
+          }
+        });
+      }
+    }
+
+    it('handles error followed by close before open without optional callbacks', async () => {
+      const apiClient = new ApiClient({
+        auth: new FakeAuth(),
+        apiKey: 'test-api-key',
+        uploader: new CrossUploader(),
+        downloader: new CrossDownloader(),
+      });
+      const factory = new FakeWebSocketFactory();
+      spyOn(factory, 'create').and.callFake((url, headers, callbacks) => {
+        const socket = new FakeWebSocket(url, headers, callbacks);
+        spyOn(socket, 'connect').and.callFake(() => {
+          callbacks.onerror({message: 'first failure'} as ErrorEvent);
+          callbacks.onclose({code: 1006, reason: ''} as CloseEvent);
+        });
+        return socket;
+      });
+      const live = new Live(apiClient, new FakeAuth(), factory);
+      let result: unknown;
+      const connecting = live
+        .connect({model: 'models/test-model', callbacks: {onmessage: () => {}}})
+        .then(
+          (session) => {
+            result = session;
+          },
+          (error: unknown) => {
+            result = error;
+          },
+        );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(result).toEqual(jasmine.any(Error));
+      if (result instanceof Error) {
+        expect(result.message).toContain('first failure');
+        await connecting;
+      }
+    });
+
+    it('keeps a connected session and forwards later error and close events', async () => {
+      const apiClient = new ApiClient({
+        auth: new FakeAuth(),
+        apiKey: 'test-api-key',
+        uploader: new CrossUploader(),
+        downloader: new CrossDownloader(),
+      });
+      const factory = new FakeWebSocketFactory();
+      let socketCallbacks: WebSocketCallbacks;
+      let close: jasmine.Spy;
+      spyOn(factory, 'create').and.callFake((url, headers, callbacks) => {
+        socketCallbacks = callbacks;
+        const socket = new FakeWebSocket(url, headers, callbacks);
+        close = spyOn(socket, 'close').and.callThrough();
+        return socket;
+      });
+      const live = new Live(apiClient, new FakeAuth(), factory);
+      const onopen = jasmine.createSpy('onopen');
+      const onmessage = jasmine.createSpy('onmessage');
+      const onerror = jasmine.createSpy('onerror');
+      const onclose = jasmine.createSpy('onclose');
+      const session = await live.connect({
+        model: 'models/test-model',
+        callbacks: {onopen, onmessage, onerror, onclose},
+      });
+      expect(session.setupComplete).toBeDefined();
+      expect(onopen).toHaveBeenCalledTimes(1);
+      expect(onmessage).toHaveBeenCalledTimes(1);
+      const errorEvent = {message: 'later failure'} as ErrorEvent;
+      const closeEvent = {code: 1000, reason: 'finished'} as CloseEvent;
+      socketCallbacks!.onerror(errorEvent);
+      expect(close!).not.toHaveBeenCalled();
+      socketCallbacks!.onclose(closeEvent);
+      expect(onerror).toHaveBeenCalledOnceWith(errorEvent);
+      expect(onclose).toHaveBeenCalledOnceWith(closeEvent);
+      expect(close!).not.toHaveBeenCalled();
+      session.close();
+      expect(close!).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('connect uses default callbacks if not provided', async () => {
     const apiClient = new ApiClient({
       auth: new FakeAuth(),
@@ -60,9 +247,6 @@ describe('live', () => {
     );
     expect(onopenString).toContain('onopen');
     expect(onopenString).toContain('onopenResolve({})');
-    expect(
-      JSON.stringify(websocketFactorySpyCall.args[2].onclose.toString()),
-    ).toContain('void e');
     expect(session).toBeDefined();
   });
 
@@ -220,12 +404,6 @@ describe('live', () => {
     );
     expect(onopenString).toContain('onopen');
     expect(onopenString).toContain('onopenResolve({})');
-    expect(
-      JSON.stringify(websocketFactorySpyCall.args[2].onerror.toString()),
-    ).toContain('void e');
-    expect(
-      JSON.stringify(websocketFactorySpyCall.args[2].onclose.toString()),
-    ).toContain('void e');
     expect(websocket.connect).toHaveBeenCalled();
     const websocketSpyCall = websocketSpy.calls.all()[0];
     expect(JSON.parse(websocketSpyCall.args[0])).toEqual({
