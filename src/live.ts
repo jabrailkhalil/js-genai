@@ -201,9 +201,11 @@ export class Live {
     let sessionResolved = false;
     let socketClosed = false;
     let connectionReject: (reason: Error) => void = () => {};
-    const connectionFailure = new Promise<never>((_resolve, reject) => {
-      connectionReject = reject;
-    });
+    let connectionFailure: Promise<never> | undefined = new Promise<never>(
+      (_resolve, reject) => {
+        connectionReject = reject;
+      },
+    );
     const messageQueue: types.LiveServerMessage[] = [];
     let setupCompleteResolve: (value: unknown) => void = () => {};
     const setupCompletePromise = new Promise((resolve) => {
@@ -257,7 +259,9 @@ export class Live {
     );
     const waitForConnection = async <T>(stage: Promise<T>): Promise<T> => {
       try {
-        return await Promise.race([connectionFailure, stage]);
+        return await Promise.race(
+          connectionFailure ? [connectionFailure, stage] : [stage],
+        );
       } catch (error) {
         if (!socketClosed) conn.close();
         throw error;
@@ -333,6 +337,8 @@ export class Live {
     conn.send(JSON.stringify(clientMessage));
     await waitForConnection(setupCompletePromise);
     sessionResolved = true;
+    connectionReject = () => {};
+    connectionFailure = undefined;
     for (const msg of messageQueue) {
       callbacks.onmessage(msg);
     }
